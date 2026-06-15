@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=2
+// HERDR_INTEGRATION_VERSION=3
 // @ts-nocheck
 
 import { createConnection } from "node:net";
@@ -164,6 +164,8 @@ export default function (pi) {
   let failureMessage: string | undefined;
   let blockedCount = 0;
   let blockedMessage: string | undefined;
+  let blockingToolActive = false;
+  let blockingToolMessage: string | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -189,6 +191,9 @@ export default function (pi) {
   }
 
   function desiredState() {
+    if (blockingToolActive) {
+      return { state: "blocked" as const, message: blockingToolMessage };
+    }
     if (blockedCount > 0) {
       return { state: "blocked" as const, message: blockedMessage };
     }
@@ -201,9 +206,9 @@ export default function (pi) {
     return { state: "idle" as const, message: undefined };
   }
 
-  function publishState() {
+  function publishState(force = false) {
     const next = desiredState();
-    if (next.state === lastState && next.message === lastMessage) {
+    if (!force && next.state === lastState && next.message === lastMessage) {
       return;
     }
     lastState = next.state;
@@ -237,25 +242,63 @@ export default function (pi) {
     retryTimer.unref?.();
   }
 
-  pi.events.on("herdr:blocked", (data) => {
-    if (!data?.active) {
-      blockedCount = Math.max(0, blockedCount - 1);
-      if (blockedCount === 0) {
-        blockedMessage = undefined;
-      }
-      publishState();
+  function toolName(event: any): string | undefined {
+    return event?.toolName ?? event?.name ?? event?.tool?.name;
+  }
+
+  function isBlockingTool(event: any): boolean {
+    return toolName(event) === "ask";
+  }
+
+  function markBlockingTool(event: any) {
+    if (!isBlockingTool(event)) {
       return;
     }
 
     clearPendingTimers();
-    blockedCount += 1;
-    blockedMessage = data.label;
+    blockingToolActive = true;
+    blockingToolMessage = "waiting for user input";
     publishState();
-  });
+  }
+
+  function clearBlockingTool(event: any) {
+    if (!isBlockingTool(event)) {
+      return;
+    }
+
+    blockingToolActive = false;
+    blockingToolMessage = undefined;
+    publishState();
+  }
+
+  if (pi.events?.on) {
+    pi.events.on("herdr:blocked", (data) => {
+      if (!data?.active) {
+        blockedCount = Math.max(0, blockedCount - 1);
+        if (blockedCount === 0) {
+          blockedMessage = undefined;
+        }
+        publishState();
+        return;
+      }
+
+      clearPendingTimers();
+      blockedCount += 1;
+      blockedMessage = data.label;
+      publishState();
+    });
+  }
 
   pi.on("session_start", () => {
-    publishState();
+    publishState(true);
   });
+
+  publishState(true);
+
+  pi.on("tool_call", markBlockingTool);
+  pi.on("tool_execution_start", markBlockingTool);
+  pi.on("tool_result", clearBlockingTool);
+  pi.on("tool_execution_end", clearBlockingTool);
 
   pi.on("agent_start", () => {
     clearPendingTimers();
